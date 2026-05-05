@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strconv"
 
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/gamelogic"
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/pubsub"
@@ -22,17 +23,52 @@ func main() {
 	defer conn.Close()
 	fmt.Println("Peril game client connected to RabbitMQ!")
 
+	connChan, err := conn.Channel()
+	if err != nil {
+		log.Fatalf("failed to create channel: %v", err)
+	}
+
 	username, err := gamelogic.ClientWelcome()
 	if err != nil {
 		log.Fatalf("failed to get username: %v", err)
 	}
 
-	gameState := gamelogic.NewGameState(username)
+	gs := gamelogic.NewGameState(username)
 
-	queueName := fmt.Sprintf("%s.%s", routing.PauseKey, username)
-	err = pubsub.SubscribeJSON(conn, routing.ExchangePerilDirect, queueName, routing.PauseKey, pubsub.Transient, handlerPause(gameState))
+	// Subscribe to Pause Queue
+	err = pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilDirect,
+		fmt.Sprintf("%s.%s", routing.PauseKey, gs.GetUsername()),
+		routing.PauseKey,
+		pubsub.Transient,
+		handlerPause(gs))
 	if err != nil {
-		log.Fatalf("failed to declare and subscribe to queue: %v", err)
+		log.Fatalf("failed to subscribe to pause: %v", err)
+	}
+
+	// Subscribe to Army Move Queue
+	err = pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilTopic,
+		fmt.Sprintf("%s.%s", routing.ArmyMovesPrefix, gs.GetUsername()),
+		fmt.Sprintf("%s.*", routing.ArmyMovesPrefix),
+		pubsub.Transient,
+		handlerMove(gs, connChan))
+	if err != nil {
+		log.Fatalf("failed to subscribe to army moves: %v", err)
+	}
+
+	// Subscribe to War Queue
+	err = pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilTopic,
+		routing.WarRecognitionsPrefix,
+		fmt.Sprintf("%s.*", routing.WarRecognitionsPrefix),
+		pubsub.Durable,
+		handlerWar(gs, connChan))
+	if err != nil {
+		log.Fatalf("failed to subscribe to war: %v", err)
 	}
 
 	for {
@@ -42,35 +78,53 @@ func main() {
 		}
 		switch words[0] {
 		case "spawn":
-			if err = gameState.CommandSpawn(words); err != nil {
+			if err = gs.CommandSpawn(words); err != nil {
 				fmt.Println(err)
 				continue
 			}
 		case "move":
-			_, err = gameState.CommandMove(words)
+			move, err := gs.CommandMove(words)
 			if err != nil {
-				fmt.Println(err)
+				fmt.Printf("failed to move: %v", err)
 				continue
 			}
-			fmt.Println("Move successful!")
+			err = pubsub.PublishJSON(
+				connChan,
+				routing.ExchangePerilTopic,
+				fmt.Sprintf("%s.%s", routing.ArmyMovesPrefix, move.Player.Username),
+				move)
+			if err != nil {
+				fmt.Printf("failed to publish move: %v", err)
+				continue
+			}
+			fmt.Printf("Moved %v units to %s\n", len(move.Units), move.ToLocation)
 		case "status":
-			gameState.CommandStatus()
+			gs.CommandStatus()
 		case "help":
 			gamelogic.PrintClientHelp()
 		case "spam":
-			fmt.Println("Spamming not allowed yet!")
+			if len(words) < 2 {
+				fmt.Println("usage: spam <int>")
+				continue
+			}
+			num, err := strconv.Atoi(words[1])
+			if err != nil {
+				fmt.Println("invalid integer")
+				continue
+			}
+			for range num {
+				msg := gamelogic.GetMaliciousLog()
+				err = publishGameLog(connChan, msg, username)
+				if err != nil {
+					fmt.Printf("failed to publish message: %v\n", err)
+				}
+			}
+			fmt.Printf("Published %v malicious logs\n", num)
 		case "quit":
 			gamelogic.PrintQuit()
 			return
 		default:
 			fmt.Println("Unknown command")
 		}
-	}
-}
-
-func handlerPause(gs *gamelogic.GameState) func(routing.PlayingState) {
-	return func(ps routing.PlayingState) {
-		defer fmt.Print("> ")
-		gs.HandlePause(ps)
 	}
 }
